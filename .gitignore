@@ -2,3 +2,6 @@
 /dist
 .env
 .smithery
+
+# Ignore compiled JS files in api folder (Vercel compiles TS on its own)
+api/*.js
