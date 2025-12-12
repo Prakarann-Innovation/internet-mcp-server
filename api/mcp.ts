@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 // Tool type definition
 interface Tool {
@@ -13,10 +12,6 @@ interface Tool {
 // Import tools from the compiled dist folder
 // @ts-ignore - importing from compiled JS, types are defined above
 import tools from '../dist/tools/index.js';
-
-// In-memory session storage (note: Vercel serverless functions are stateless,
-// so sessions won't persist across cold starts)
-const transports = new Map<string, StreamableHTTPServerTransport>();
 
 function createMcpServer(): McpServer {
   const mcpServer = new McpServer(
@@ -80,44 +75,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    let transport: StreamableHTTPServerTransport;
+    // Stateless mode: Create a fresh transport and server for each request
+    // This works better with serverless functions that don't persist state
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
 
-    // Check for existing session
-    if (sessionId && transports.has(sessionId)) {
-      transport = transports.get(sessionId)!;
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      // New session - create transport with session ID generator
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (newSessionId) => {
-          transports.set(newSessionId, transport);
-        },
-      });
-
-      const mcpServer = createMcpServer();
-      await mcpServer.connect(transport);
-    } else if (sessionId && !transports.has(sessionId)) {
-      // Session ID provided but not found (could be due to serverless cold start)
-      return res.status(400).json({
-        id: null,
-        jsonrpc: '2.0',
-        error: { 
-          code: -32600, 
-          message: 'Session not found. Serverless functions are stateless - please reinitialize.' 
-        },
-      });
-    } else {
-      // No session ID and not an initialize request
-      return res.status(400).json({
-        id: null,
-        jsonrpc: '2.0',
-        error: { 
-          code: -32600, 
-          message: 'Missing mcp-session-id header. Send an initialize request first.' 
-        },
-      });
-    }
+    const mcpServer = createMcpServer();
+    await mcpServer.connect(transport);
 
     // Handle the request using the transport
     await transport.handleRequest(req, res, req.body);
