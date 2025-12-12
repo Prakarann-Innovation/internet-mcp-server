@@ -2,17 +2,21 @@ import { randomUUID } from 'node:crypto';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { ListToolsRequest, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+
+// Tool type definition
+interface Tool {
+  name: string;
+  register: (mcpServer: McpServer) => void;
+}
 
 // Import tools from the compiled dist folder
+// @ts-ignore - importing from compiled JS, types are defined above
 import tools from '../dist/tools/index.js';
 
 // In-memory session storage (note: Vercel serverless functions are stateless,
 // so sessions won't persist across cold starts)
 const transports = new Map<string, StreamableHTTPServerTransport>();
-
-const isListToolsRequest = (value: unknown): value is ListToolsRequest =>
-  ListToolsRequestSchema.safeParse(value).success;
 
 function createMcpServer(): McpServer {
   const mcpServer = new McpServer(
@@ -31,45 +35,13 @@ function createMcpServer(): McpServer {
   );
 
   // Register all tools
-  for (const tool of Object.values(tools)) {
+  const toolsRecord = tools as Record<string, Tool>;
+  for (const tool of Object.values(toolsRecord)) {
     tool.register(mcpServer);
   }
 
   return mcpServer;
 }
-
-const getTransport = async (
-  sessionId: string | undefined,
-  body: unknown
-): Promise<StreamableHTTPServerTransport> => {
-  // Check for an existing session
-  if (sessionId && transports.has(sessionId)) {
-    return transports.get(sessionId)!;
-  }
-
-  // We have a special case where we'll permit ListToolsRequest w/o a session ID
-  if (!sessionId && isListToolsRequest(body)) {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-
-    const mcpServer = createMcpServer();
-    await mcpServer.connect(transport);
-    return transport;
-  }
-
-  // Otherwise, start a new transport/session
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (newSessionId) => {
-      transports.set(newSessionId, transport);
-    },
-  });
-
-  const mcpServer = createMcpServer();
-  await mcpServer.connect(transport);
-  return transport;
-};
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Handle CORS for preflight requests
@@ -98,69 +70,66 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   }
 
+  // Only accept POST requests for MCP
+  if (req.method !== 'POST') {
+    return res.status(405).json({
+      id: null,
+      jsonrpc: '2.0',
+      error: { code: -32600, message: 'Method not allowed. Use POST for MCP requests.' },
+    });
+  }
+
   try {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    const transport = await getTransport(sessionId, req.body);
+    let transport: StreamableHTTPServerTransport;
 
-    // Create a mock request/response for the transport
-    // The StreamableHTTPServerTransport expects Express-like req/res
-    const mockReq = {
-      method: req.method,
-      headers: req.headers,
-      body: req.body,
-      on: (event: string, callback: () => void) => {
-        if (event === 'close') {
-          // Handle connection close if needed
-        }
-      },
-    };
+    // Check for existing session
+    if (sessionId && transports.has(sessionId)) {
+      transport = transports.get(sessionId)!;
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      // New session - create transport with session ID generator
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          transports.set(newSessionId, transport);
+        },
+      });
 
-    const mockRes = {
-      statusCode: 200,
-      headersSent: false,
-      _headers: {} as Record<string, string>,
-      setHeader(name: string, value: string) {
-        this._headers[name] = value;
-        res.setHeader(name, value);
-      },
-      getHeader(name: string) {
-        return this._headers[name];
-      },
-      status(code: number) {
-        this.statusCode = code;
-        res.status(code);
-        return this;
-      },
-      json(data: unknown) {
-        this.headersSent = true;
-        return res.json(data);
-      },
-      send(data: unknown) {
-        this.headersSent = true;
-        return res.send(data);
-      },
-      end(data?: unknown) {
-        this.headersSent = true;
-        return res.end(data);
-      },
-      write(chunk: unknown) {
-        return res.write(chunk);
-      },
-      flushHeaders() {
-        // Vercel handles this automatically
-      },
-    };
+      const mcpServer = createMcpServer();
+      await mcpServer.connect(transport);
+    } else if (sessionId && !transports.has(sessionId)) {
+      // Session ID provided but not found (could be due to serverless cold start)
+      return res.status(400).json({
+        id: null,
+        jsonrpc: '2.0',
+        error: { 
+          code: -32600, 
+          message: 'Session not found. Serverless functions are stateless - please reinitialize.' 
+        },
+      });
+    } else {
+      // No session ID and not an initialize request
+      return res.status(400).json({
+        id: null,
+        jsonrpc: '2.0',
+        error: { 
+          code: -32600, 
+          message: 'Missing mcp-session-id header. Send an initialize request first.' 
+        },
+      });
+    }
 
-    await transport.handleRequest(mockReq as any, mockRes as any, req.body);
+    // Handle the request using the transport
+    await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error('MCP Handler Error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     if (!res.headersSent) {
       return res.status(500).json({
         id: null,
         jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
+        error: { code: -32603, message: `Internal server error: ${errorMessage}` },
       });
     }
   }
 }
-
