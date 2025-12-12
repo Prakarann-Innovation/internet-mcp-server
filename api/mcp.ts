@@ -2,12 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { 
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-  type ListToolsRequest,
-  type CallToolRequest 
-} from '@modelcontextprotocol/sdk/types.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 // Tool type definition
 interface Tool {
@@ -18,18 +13,6 @@ interface Tool {
 // Import tools from the compiled dist folder
 // @ts-ignore - importing from compiled JS, types are defined above
 import tools from '../dist/tools/index.js';
-
-// Type guards for stateless requests
-const isListToolsRequest = (value: unknown): value is ListToolsRequest =>
-  ListToolsRequestSchema.safeParse(value).success;
-
-const isCallToolRequest = (value: unknown): value is CallToolRequest =>
-  CallToolRequestSchema.safeParse(value).success;
-
-// Check if request can be handled statelessly (without session)
-const isStatelessRequest = (body: unknown): boolean => {
-  return isListToolsRequest(body) || isCallToolRequest(body);
-};
 
 function createMcpServer(): McpServer {
   const mcpServer = new McpServer(
@@ -93,12 +76,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    // For stateless requests (tools/list, tools/call), don't generate session ID
-    // This allows them to work without initialization in serverless environments
-    const useStatelessMode = isStatelessRequest(req.body);
-    
+    // SERVERLESS MODE: Create fresh transport for EVERY request
+    // We ignore any incoming session ID since we can't persist sessions
+    // Generate a new session ID only for initialize requests
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: useStatelessMode ? undefined : () => randomUUID(),
+      sessionIdGenerator: isInitializeRequest(req.body) ? () => randomUUID() : undefined,
     });
 
     const mcpServer = createMcpServer();
